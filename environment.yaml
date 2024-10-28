@@ -8,13 +8,12 @@ dependencies:
   - cudatoolkit=11.3
   - pytorch=1.11.0
   - torchvision=0.12.0
-  - numpy=1.19.2
+  - numpy=1.20.3
   - pip:
     - albumentations==0.4.3
     - diffusers
     - opencv-python==4.1.2.30
     - pudb==2019.2
-    - invisible-watermark
     - imageio==2.9.0
     - imageio-ffmpeg==0.4.2
     - pytorch-lightning==1.4.2
@@ -23,9 +22,11 @@ dependencies:
     - streamlit>=0.73.1
     - einops==0.3.0
     - torch-fidelity==0.3.0
-    - transformers==4.19.2
+    - transformers==4.46.0
     - torchmetrics==0.6.0
     - kornia==0.6
+    - invisible_watermark==0.2.0
+    - diffusers==0.26.3
     - -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
     - -e git+https://github.com/openai/CLIP.git@main#egg=clip
     - -e .
