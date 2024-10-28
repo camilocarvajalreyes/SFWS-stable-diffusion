@@ -15,18 +15,28 @@ from torch import autocast
 from contextlib import contextmanager, nullcontext
 
 from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.models.diffusion.ddim import DDIMSampler  # Includes external clf. conditioning
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+# Deactivating the filer, although it is safer to keep the filter on when not generating for research purposes, see line 429
+# from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 
+from transformers import logging
+logging.set_verbosity_error()
 
-# load safety model
-safety_model_id = "CompVis/stable-diffusion-safety-checker"
-safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+import warnings
+
+# load CLIP general classifier
+from classifiers.CLIP_cosine import ConceptCosine
+from classifiers.CLIP_matching import ConceptMatching
+from classifiers.ALIGN_matching import AlignMatching
+
+# Deactivating the filer, although it is safer to keep the filter on when not generating for research purposes, see line 429
+# safety_model_id = "CompVis/stable-diffusion-safety-checker"
+# safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+# safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
 def chunk(it, size):
@@ -85,14 +95,44 @@ def load_replacement(x):
         return x
 
 
-def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
+# Deactivating the filer, although it is safer to keep the filter on when not generating for research purposes, see line 429
+# def check_safety(x_image):
+#     safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
+#     x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
+#     assert x_checked_image.shape[0] == len(has_nsfw_concept)
+#     for i in range(len(has_nsfw_concept)):
+#         if has_nsfw_concept[i]:
+#             x_checked_image[i] = load_replacement(x_checked_image[i])
+#     return x_checked_image, has_nsfw_concept
+
+
+def get_log_prob(prob_model,preprocessing=None,top_k=None):
+    """
+    Returns a function that returns the logarithm of the forward pass output
+
+    Arguments:
+    ----------
+        prob_model: nn.module
+            instance of a model class that inherits from nn.module, with an implemented forward pass
+        
+        preprocessing: Callable[torch.Tensor]
+            pre-processing step, if needed
+
+        top_k: int, default None
+            Only highest top_k probabilities will be considered (applicable to multiconcept CLFs)
+    
+    Returns
+    -------
+        log_prob: Callable[torch.Tensor]
+    """
+    def log_prob(x):
+        if preprocessing is not None:
+            x = preprocessing(x)
+        prob = prob_model(x)
+        if top_k:
+            prob = torch.topk(prob,top_k,dim=1)[0]
+        return torch.log(prob)
+    return log_prob
 
 
 def main():
@@ -157,7 +197,7 @@ def main():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=5,
         help="sample this often",
     )
     parser.add_argument(
@@ -187,7 +227,7 @@ def main():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=2,
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
@@ -199,7 +239,7 @@ def main():
     parser.add_argument(
         "--scale",
         type=float,
-        default=7.5,
+        default=7,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -232,6 +272,38 @@ def main():
         choices=["full", "autocast"],
         default="autocast"
     )
+    parser.add_argument(
+        "--gamma",
+        type = float,
+        default = 75,
+        help = "Unguidance strength (Guidance factor in Universal Guidance)"
+    )
+    parser.add_argument(
+        "--clf",
+        type=str,
+        help="classifier for unguidance, 'None' for no unguidance",
+        choices=["CLIP_cosine","CLIP_matching","ALIGN_matching","None"],
+        default = "None"
+    )
+    parser.add_argument(
+        "--concept",
+        type=str,
+        help="Concepts to include in CLIP/ALIGN guidance signals, comma-separated",
+        default = "Uncensored"
+    )
+    parser.add_argument(
+        "--top_k",
+        type = int,
+        default = 1,
+        help = "Only highest top_k probabilities will be considered (applicable to multiconcept CLFs)"
+    )
+    parser.add_argument(
+        "--eta",
+        type = float,
+        help = """threshold for applying the classifier unguidance.
+        If the probability is under the threshold, the noise network remains unchanged.""",
+        default = 0.23
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -250,8 +322,10 @@ def main():
 
     if opt.dpm_solver:
         sampler = DPMSolverSampler(model)
+        warnings.warn("Classifier safe unguidance not yet implemented in DPMSolverSampler")
     elif opt.plms:
         sampler = PLMSSampler(model)
+        warnings.warn("Classifier safe unguidance not yet implemented in PLMSampler")
     else:
         sampler = DDIMSampler(model)
 
@@ -275,6 +349,37 @@ def main():
         with open(opt.from_file, "r") as f:
             data = f.read().splitlines()
             data = list(chunk(data, batch_size))
+    
+    # log_prob function for classifier unguidance
+    clf_name = opt.clf
+    if "CLIP_" in clf_name or "ALIGN_" in clf_name:
+        if ',' in opt.concept:
+            opt.concept = opt.concept.split(',')
+            print(f'Loading {clf_name} classifier with concepts: {opt.concept}')
+            clf_name += '_multi'
+        else:
+            opt.concept = [opt.concept]
+            print(f'Loading {clf_name} classifier with concept: "{opt.concept[0]}"')
+            opt.top_k = None
+    if opt.gamma == 0 or clf_name == "None":
+        log_prob_fn = None
+        opt.gamma, clf = 0, "None"
+        warning = "Clf unguidance not used since either gamma is set to 0 or clf is set to None."
+        warnings.warn(warning)
+    elif "CLIP_cosine" in clf_name:
+        clf = ConceptCosine(model_name="ViT-B/16")
+        clf.load_concept_embeddings(opt.concept)
+        log_prob_fn = get_log_prob(clf,preprocessing=clf.preprocess,top_k=opt.top_k)
+    elif "CLIP_matching" in clf_name:
+        clf = ConceptMatching(model_name="ViT-B/16")
+        clf.load_base_embedding(["A safe picture"])
+        clf.load_concept_embeddings(opt.concept)
+        log_prob_fn = get_log_prob(clf,preprocessing=clf.preprocess,top_k=opt.top_k)
+    elif "ALIGN_matching" in clf_name:
+        clf = AlignMatching()
+        clf.load_base_embedding(["A safe picture"])
+        clf.load_concept_embeddings(opt.concept)
+        log_prob_fn = get_log_prob(clf,preprocessing=clf.preprocess,top_k=opt.top_k)
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -308,13 +413,24 @@ def main():
                                                          unconditional_guidance_scale=opt.scale,
                                                          unconditional_conditioning=uc,
                                                          eta=opt.ddim_eta,
-                                                         x_T=start_code)
+                                                         x_T=start_code,
+                                                        # parameters for MPGD-based unguidance
+                                                        gamma = opt.gamma,
+                                                        log_prob = log_prob_fn,
+                                                        threshold_clf = opt.eta,
+                                                        )
 
                         x_samples_ddim = model.decode_first_stage(samples_ddim)
                         x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        # Important remark: we are removing the application of the filter,
+                        # but only because we are researching alternative ways of making SD safer
+                        # Original line:
+                        # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                        # Modified line (i.e., unfiltered generation)
+                        x_checked_image = x_samples_ddim
+                        # Please do keep in mind that it is safer to keep the filter on when not generating for research purposes
 
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 

@@ -1,9 +1,12 @@
-"""SAMPLING ONLY."""
+"""
+Modification of DDIM based on Manifold Preserving Guidance
+"""
 
 import torch
 import numpy as np
 from tqdm import tqdm
-from functools import partial
+import sys
+import os
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, \
     extract_into_tensor
@@ -75,6 +78,10 @@ class DDIMSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               # parameters for unguidance
+               log_prob = None,
+               gamma = 1.0,
+               threshold_clf = 0,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -107,6 +114,10 @@ class DDIMSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
+                                                    # parameters for unguidance
+                                                    log_prob = log_prob,
+                                                    gamma = gamma,
+                                                    threshold_clf = threshold_clf,
                                                     )
         return samples, intermediates
 
@@ -116,7 +127,8 @@ class DDIMSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      log_prob=None, gamma=1.0, threshold_clf=0):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -151,8 +163,9 @@ class DDIMSampler(object):
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning)
-            img, pred_x0 = outs
+                                      unconditional_conditioning=unconditional_conditioning,
+                                      log_prob=log_prob, gamma=gamma, threshold_clf=threshold_clf)
+            img, pred_x0, prob_clf = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -162,10 +175,10 @@ class DDIMSampler(object):
 
         return img, intermediates
 
-    @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      log_prob=None, gamma=1.0, threshold_clf=0):
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
@@ -191,17 +204,48 @@ class DDIMSampler(object):
         sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
 
-        # current prediction for x_0
-        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-        if quantize_denoised:
-            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+        if log_prob is not None:
+            # Apply MPGD
+
+            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+
+            torch.set_grad_enabled(True)
+            pred_x0 = pred_x0.detach().requires_grad_(True)
+
+            recons_x = self.model.decode_first_stage_with_grad(pred_x0)
+
+            log_prob_output = log_prob(recons_x)
+            prob_clf = torch.exp(log_prob_output).detach()
+
+            # WARNING: if log_prob_output doesn't meet the threshold then this step could be deleted and decrease inference time
+            grad = torch.autograd.grad(log_prob_output.sum(), pred_x0)[0]
+            grad *= gamma
+
+            # only using those gradients where the probability is greater than the threshold
+            condition = torch.where(torch.max(prob_clf,dim=1,keepdim=True)[0] > threshold_clf,1.,0.).unsqueeze(1).unsqueeze(1).to(grad.get_device())
+            grad = grad * condition
+
+            torch.set_grad_enabled(False)
+
+            pred_x0 = pred_x0.detach() - grad.detach()
+            
+        
+        else:
+            # current prediction for x_0
+            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            if quantize_denoised:
+                pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+
+            prob_clf = torch.zeros((b,1))
+
         # direction pointing to x_t
         dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
         noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-        return x_prev, pred_x0
+
+        return x_prev, pred_x0, prob_clf
 
     @torch.no_grad()
     def stochastic_encode(self, x0, t, use_original_steps=False, noise=None):
